@@ -214,6 +214,9 @@ class PoETradeClient:
         category_id: str,
         rarity_option: str = "",
         online_only: bool = True,
+        price_currency_option: str = "",
+        sort_field: str = "price",
+        sort_order: str = "asc",
     ) -> SearchResponse:
         url = f"{self.base_url}/api/trade/search/{league}"
         type_filters: dict[str, Any] = {}
@@ -222,21 +225,32 @@ class PoETradeClient:
         if rarity_option.strip():
             type_filters["rarity"] = {"option": rarity_option.strip()}
 
+        trade_filters: dict[str, Any] = {
+            # Trade API option "priced" corresponds to listings with explicit buyout prices.
+            "sale_type": {"option": "priced"}
+        }
+        if price_currency_option.strip():
+            trade_filters["price"] = {"option": price_currency_option.strip()}
+
         query_body: dict[str, Any] = {
             "status": {"option": "online" if online_only else "any"},
         }
-        if type_filters:
-            query_body["filters"] = {
-                "type_filters": {
-                    "filters": type_filters,
-                }
+        query_filters: dict[str, Any] = {
+            "trade_filters": {
+                "filters": trade_filters,
             }
+        }
+        if type_filters:
+            query_filters["type_filters"] = {
+                "filters": type_filters,
+            }
+        query_body["filters"] = query_filters
         if query_text.strip():
             query_body["term"] = query_text.strip()
 
         payload: dict[str, Any] = {
             "query": query_body,
-            "sort": {"price": "asc"},
+            "sort": {sort_field: sort_order},
         }
 
         data = self._request_json("POST", url, json=payload)

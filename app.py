@@ -4,7 +4,7 @@ from urllib.parse import quote
 
 import streamlit as st
 
-from arbitrage import analyze_arbitrage, normalize_currency
+from arbitrage import extract_price, get_item_name, normalize_currency
 from poe_trade import PoETradeClient, RateLimitError, TradeAPIError
 
 
@@ -99,6 +99,8 @@ def init_state() -> None:
         "latest_fetched_rows": [],
         "all_opportunities": [],
         "active_league": "",
+        "chaos_query_id": "",
+        "chaos_best_by_key": {},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -114,6 +116,8 @@ def reset_state() -> None:
     st.session_state.latest_fetched_rows = []
     st.session_state.all_opportunities = []
     st.session_state.active_league = ""
+    st.session_state.chaos_query_id = ""
+    st.session_state.chaos_best_by_key = {}
 
 
 def get_trade_client() -> PoETradeClient:
@@ -189,7 +193,30 @@ def _get_normalized_price(record: dict) -> tuple[str, float | None]:
     return normalized, amount
 
 
+def _is_instant_buyout_listing(record: dict) -> bool:
+    listing = record.get("listing", {})
+    if not isinstance(listing, dict):
+        return False
+
+    note = str(listing.get("note", "")).strip().lower()
+    if note.startswith("~b/o") or note.startswith("~bo"):
+        return True
+
+    price = listing.get("price")
+    if not isinstance(price, dict):
+        return False
+
+    price_type = str(price.get("type", "")).strip().lower()
+    if price_type in {"~b/o", "~bo", "b/o", "bo", "buyout"}:
+        return True
+
+    return False
+
+
 def _passes_default_minimums(record: dict, divine_ratio: float) -> bool:
+    if not _is_instant_buyout_listing(record):
+        return False
+
     currency, amount = _get_normalized_price(record)
     if amount is None:
         return False
@@ -199,6 +226,135 @@ def _passes_default_minimums(record: dict, divine_ratio: float) -> bool:
     if currency == "chaos":
         return amount >= divine_ratio
     return False
+
+
+def _comparison_key(record: dict) -> str:
+    item = record.get("item", {})
+    name = (item.get("name") or "").strip().lower()
+    type_line = (item.get("typeLine") or "").strip().lower()
+    return "|".join([name, type_line])
+
+
+def _fetch_records(client: PoETradeClient, query_id: str, listing_ids: list[str]) -> list[dict]:
+    records: list[dict] = []
+    for i in range(0, len(listing_ids), PAGE_SIZE):
+        chunk = listing_ids[i : i + PAGE_SIZE]
+        records.extend(client.fetch_listings(query_id, chunk))
+    return records
+
+
+def _build_chaos_baseline(
+    client: PoETradeClient,
+    league: str,
+    query_text: str,
+    category_id: str,
+    rarity_option: str,
+    online_only: bool,
+    sample_limit: int,
+) -> tuple[str, dict[str, dict]]:
+    chaos_search = client.search_listings(
+        league,
+        query_text,
+        category_id=category_id,
+        rarity_option=rarity_option,
+        online_only=online_only,
+        price_currency_option="chaos",
+        sort_field="price",
+        sort_order="asc",
+    )
+
+    fetch_ids = chaos_search.result_ids[:sample_limit]
+    chaos_records = _fetch_records(client, chaos_search.query_id, fetch_ids)
+
+    best_by_key: dict[str, dict] = {}
+    for record in chaos_records:
+        if not _is_instant_buyout_listing(record):
+            continue
+        price = extract_price(record, divine_to_chaos=1.0)
+        if not price or price["currency"] != "chaos":
+            continue
+        key = _comparison_key(record)
+        existing = best_by_key.get(key)
+        if existing is None or price["amount"] < existing["amount"]:
+            best_by_key[key] = {
+                "amount": float(price["amount"]),
+                "listing_id": str(record.get("id", "")),
+                "query_id": chaos_search.query_id,
+            }
+
+    return chaos_search.query_id, best_by_key
+
+
+def _pair_rows_for_divines(
+    divine_records: list[dict],
+    chaos_best_by_key: dict[str, dict],
+    divine_ratio: float,
+    league: str,
+    divine_query_id: str,
+    chaos_query_id: str,
+) -> list[dict]:
+    rows: list[dict] = []
+    for record in divine_records:
+        divine_price = extract_price(record, divine_ratio)
+        if not divine_price or divine_price["currency"] != "divine" or divine_price["amount"] < 1.0:
+            continue
+
+        key = _comparison_key(record)
+        chaos_price = chaos_best_by_key.get(key)
+        if not chaos_price:
+            continue
+
+        item_name = get_item_name(record)
+        profit = chaos_price["amount"] - divine_price["chaos_equivalent"]
+        rows.append(
+            {
+                "Item": item_name,
+                "Listed Price (Divine)": float(divine_price["amount"]),
+                "Listed Price (Chaos)": float(chaos_price["amount"]),
+                "Spread (Chaos)": round(profit, 2),
+                "Divine Link": listing_url(league, divine_query_id, str(record.get("id", ""))),
+                "Chaos Link": listing_url(league, chaos_query_id, chaos_price["listing_id"]),
+            }
+        )
+    return rows
+
+
+def _build_opportunities(
+    divine_records: list[dict],
+    chaos_best_by_key: dict[str, dict],
+    divine_ratio: float,
+    min_profit: float,
+) -> list[dict]:
+    best_by_key: dict[str, dict] = {}
+    for record in divine_records:
+        divine_price = extract_price(record, divine_ratio)
+        if not divine_price or divine_price["currency"] != "divine" or divine_price["amount"] < 1.0:
+            continue
+
+        key = _comparison_key(record)
+        chaos_price = chaos_best_by_key.get(key)
+        if not chaos_price:
+            continue
+
+        profit = float(chaos_price["amount"] - divine_price["chaos_equivalent"])
+        if profit < min_profit:
+            continue
+
+        candidate = {
+            "item": get_item_name(record),
+            "profit_chaos": round(profit, 2),
+            "buy_divine_amount": float(divine_price["amount"]),
+            "sell_chaos_amount": float(chaos_price["amount"]),
+            "divine_listing_id": str(record.get("id", "")),
+            "chaos_listing_id": chaos_price["listing_id"],
+        }
+        existing = best_by_key.get(key)
+        if existing is None or candidate["profit_chaos"] > existing["profit_chaos"]:
+            best_by_key[key] = candidate
+
+    opportunities = list(best_by_key.values())
+    opportunities.sort(key=lambda x: x["profit_chaos"], reverse=True)
+    return opportunities
 
 
 def scan_next_batch(
@@ -226,43 +382,44 @@ def scan_next_batch(
         return
 
     remaining_safe = max_scan - st.session_state.scanned
-    local_offset = offset
-    requested_ids = 0
-    records: list[dict] = []
+    batch_size = min(PAGE_SIZE, remaining_safe)
+    ids = result_ids[offset : offset + batch_size]
+    if not ids:
+        st.error("No more results available for this search.")
+        return
 
-    # Results are globally sorted by price and include non-chaos/divine entries.
-    # Keep scanning forward until we collect up to PAGE_SIZE qualifying listings.
-    while local_offset < len(result_ids) and requested_ids < remaining_safe and len(records) < PAGE_SIZE:
-        chunk_size = min(PAGE_SIZE, remaining_safe - requested_ids)
-        ids = result_ids[local_offset : local_offset + chunk_size]
-        if not ids:
-            break
+    records = client.fetch_listings(query_id, ids)
+    divine_records: list[dict] = []
+    for record in records:
+        if not _is_instant_buyout_listing(record):
+            continue
+        price = extract_price(record, divine_ratio)
+        if price and price["currency"] == "divine" and price["amount"] >= 1.0:
+            divine_records.append(record)
 
-        fetched = client.fetch_listings(query_id, ids)
-        for record in fetched:
-            if _passes_default_minimums(record, divine_ratio):
-                records.append(record)
-                if len(records) >= PAGE_SIZE:
-                    break
+    if not divine_records:
+        st.warning("No qualifying divine buyout listings found in this batch.")
 
-        local_offset += len(ids)
-        requested_ids += len(ids)
+    st.session_state.all_records.extend(divine_records)
+    chaos_best_by_key: dict[str, dict] = st.session_state.chaos_best_by_key
+    chaos_query_id: str = st.session_state.chaos_query_id
+    rows = _pair_rows_for_divines(
+        divine_records,
+        chaos_best_by_key,
+        divine_ratio,
+        st.session_state.active_league,
+        query_id,
+        chaos_query_id,
+    )
+    opportunities = _build_opportunities(
+        st.session_state.all_records,
+        chaos_best_by_key,
+        divine_ratio,
+        min_profit,
+    )
 
-    if not records:
-        st.warning(
-            "No qualifying listings found in this scan range. "
-            "Only chaos >= Divine->Chaos ratio and divine >= 1 are considered."
-        )
-    rows = [
-        listing_to_row(record, divine_ratio, st.session_state.active_league, query_id)
-        for record in records
-    ]
-
-    st.session_state.all_records.extend(records)
-    opportunities = analyze_arbitrage(st.session_state.all_records, divine_ratio, min_profit)
-
-    st.session_state.offset = local_offset
-    st.session_state.scanned += requested_ids
+    st.session_state.offset += len(ids)
+    st.session_state.scanned += len(ids)
     st.session_state.latest_fetched_rows = rows
     st.session_state.all_opportunities = opportunities
 
@@ -301,8 +458,7 @@ def main() -> None:
 
     st.title("Path of Exile 1 Arbitrage Scanner")
     st.caption(
-        "Find listings where buying in divines and reselling in chaos may create a spread. "
-        "This scans in small batches to reduce API pressure."
+        "Scans most recent divine buyout listings and compares each to chaos buyout prices for the same item."
     )
 
     with st.sidebar:
@@ -370,11 +526,11 @@ def main() -> None:
         )
 
         max_scan = st.number_input(
-            "Max listings to scan",
+            "Recent divine listings to scan",
             min_value=10,
             value=DEFAULT_MAX_SCAN,
             step=10,
-            help="Safety cap to avoid excessive requests. Each click scans up to 10 listings.",
+            help="Number of most recent divine buyout listings to evaluate.",
         )
 
         start_search = st.button("Start new search", use_container_width=True)
@@ -413,11 +569,26 @@ def main() -> None:
                     category_id=selected_category_id,
                     rarity_option=selected_rarity,
                     online_only=True,
+                    price_currency_option="divine",
+                    sort_field="indexed",
+                    sort_order="desc",
+                )
+
+                chaos_query_id, chaos_best_by_key = _build_chaos_baseline(
+                    client,
+                    league,
+                    query_text,
+                    selected_category_id,
+                    selected_rarity,
+                    online_only=True,
+                    sample_limit=max(200, int(max_scan) * 5),
                 )
 
                 st.session_state.query_id = search.query_id
                 st.session_state.result_ids = search.result_ids
                 st.session_state.active_league = league
+                st.session_state.chaos_query_id = chaos_query_id
+                st.session_state.chaos_best_by_key = chaos_best_by_key
 
                 st.success(f"Search created. Total trade hits reported: {search.total}")
                 if search.result_ids:
