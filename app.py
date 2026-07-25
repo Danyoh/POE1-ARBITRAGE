@@ -14,16 +14,25 @@ DEFAULT_MAX_SCAN = 50
 COMMON_LEAGUES = [
     "Standard",
     "Hardcore",
-    "Allflame Standard",
-    "Allflame Hardcore",
+    "Allflame",
+    "Hardcore Allflame",
 ]
+
+LEAGUE_ALIASES = {
+    "standard": "Standard",
+    "hardcore": "Hardcore",
+    "allflame": "Allflame",
+    "allflame standard": "Allflame",
+    "hardcore allflame": "Hardcore Allflame",
+    "allflame hardcore": "Hardcore Allflame",
+}
 
 FALLBACK_CATEGORY_OPTIONS = [
     ("", "Any"),
     ("weapon", "Any Weapon"),
     ("weapon.one", "One-handed weapon"),
     ("weapon.two", "Two-handed weapon"),
-    ("itemisedcorpse", "Any Corpse"),
+    ("corpse", "Any Corpse"),
     ("accessory", "Accessories"),
     ("armour", "Armour"),
     ("card", "Cards"),
@@ -52,7 +61,7 @@ TYPE_FILTER_PRESETS = [
     ("weapon", "Any Weapon"),
     ("weapon.one", "One-handed weapon"),
     ("weapon.two", "Two-handed weapon"),
-    ("itemisedcorpse", "Any Corpse"),
+    ("corpse", "Any Corpse"),
 ]
 
 
@@ -107,6 +116,19 @@ def reset_state() -> None:
     st.session_state.active_league = ""
 
 
+def get_trade_client() -> PoETradeClient:
+    if "trade_client" not in st.session_state:
+        st.session_state.trade_client = PoETradeClient()
+    return st.session_state.trade_client
+
+
+def normalize_league_name(league: str) -> str:
+    normalized = " ".join((league or "").strip().split())
+    if not normalized:
+        return ""
+    return LEAGUE_ALIASES.get(normalized.lower(), normalized)
+
+
 def listing_url(league: str, query_id: str, listing_id: str) -> str:
     safe_league = quote(league, safe="")
     return (
@@ -118,7 +140,6 @@ def listing_url(league: str, query_id: str, listing_id: str) -> str:
 def listing_to_row(record: dict, divine_ratio: float, league: str, query_id: str) -> dict:
     item = record.get("item", {})
     listing = record.get("listing", {})
-    account = listing.get("account", {})
     listing_id = str(record.get("id", ""))
     item_name = (item.get("name") or "").strip()
     type_line = (item.get("typeLine") or "").strip()
@@ -148,10 +169,36 @@ def listing_to_row(record: dict, divine_ratio: float, league: str, query_id: str
         "Currency": currency or "Unknown",
         "Amount": amount,
         "Chaos equiv": chaos_equiv,
-        "Seller": account.get("name", ""),
         "Indexed": listing.get("indexed", ""),
         "Link": listing_url(league, query_id, listing_id) if listing_id and query_id and league else "",
     }
+
+
+def _get_normalized_price(record: dict) -> tuple[str, float | None]:
+    listing = record.get("listing", {})
+    price = listing.get("price")
+    if not isinstance(price, dict):
+        return "", None
+
+    normalized = normalize_currency(str(price.get("currency", "")))
+    raw_amount = price.get("amount")
+    try:
+        amount = float(raw_amount)
+    except (TypeError, ValueError):
+        return normalized, None
+    return normalized, amount
+
+
+def _passes_default_minimums(record: dict, divine_ratio: float) -> bool:
+    currency, amount = _get_normalized_price(record)
+    if amount is None:
+        return False
+
+    if currency == "divine":
+        return amount >= 1.0
+    if currency == "chaos":
+        return amount >= divine_ratio
+    return False
 
 
 def scan_next_batch(
@@ -179,13 +226,33 @@ def scan_next_batch(
         return
 
     remaining_safe = max_scan - st.session_state.scanned
-    batch_size = min(PAGE_SIZE, remaining_safe)
-    ids = result_ids[offset : offset + batch_size]
-    if not ids:
-        st.error("No more results available for this search.")
-        return
+    local_offset = offset
+    requested_ids = 0
+    records: list[dict] = []
 
-    records = client.fetch_listings(query_id, ids)
+    # Results are globally sorted by price and include non-chaos/divine entries.
+    # Keep scanning forward until we collect up to PAGE_SIZE qualifying listings.
+    while local_offset < len(result_ids) and requested_ids < remaining_safe and len(records) < PAGE_SIZE:
+        chunk_size = min(PAGE_SIZE, remaining_safe - requested_ids)
+        ids = result_ids[local_offset : local_offset + chunk_size]
+        if not ids:
+            break
+
+        fetched = client.fetch_listings(query_id, ids)
+        for record in fetched:
+            if _passes_default_minimums(record, divine_ratio):
+                records.append(record)
+                if len(records) >= PAGE_SIZE:
+                    break
+
+        local_offset += len(ids)
+        requested_ids += len(ids)
+
+    if not records:
+        st.warning(
+            "No qualifying listings found in this scan range. "
+            "Only chaos >= Divine->Chaos ratio and divine >= 1 are considered."
+        )
     rows = [
         listing_to_row(record, divine_ratio, st.session_state.active_league, query_id)
         for record in records
@@ -194,8 +261,8 @@ def scan_next_batch(
     st.session_state.all_records.extend(records)
     opportunities = analyze_arbitrage(st.session_state.all_records, divine_ratio, min_profit)
 
-    st.session_state.offset += len(ids)
-    st.session_state.scanned += len(ids)
+    st.session_state.offset = local_offset
+    st.session_state.scanned += requested_ids
     st.session_state.latest_fetched_rows = rows
     st.session_state.all_opportunities = opportunities
 
@@ -219,10 +286,8 @@ def render_results() -> None:
         table.append(
             {
                 "Item": str(row["item"]),
-                "Profit (chaos)": float(row["profit_chaos"]),
-                "Buy (divine)": float(row["buy_divine_amount"]),
-                "Buy chaos-equiv": float(row["buy_chaos_equivalent"]),
-                "Sell (chaos)": float(row["sell_chaos_amount"]),
+                "Listed Price (Divine)": float(row["buy_divine_amount"]),
+                "Listed Price (Chaos)": float(row["sell_chaos_amount"]),
             }
         )
 
@@ -232,7 +297,7 @@ def render_results() -> None:
 def main() -> None:
     st.set_page_config(page_title="PoE1 Divine/Chaos Arbitrage", layout="wide")
     init_state()
-    client = PoETradeClient()
+    client = get_trade_client()
 
     st.title("Path of Exile 1 Arbitrage Scanner")
     st.caption(
@@ -246,6 +311,7 @@ def main() -> None:
         selected_league = st.selectbox("League", options=COMMON_LEAGUES, index=0)
         custom_league = st.text_input("Custom league (optional)", value="")
         league = custom_league.strip() or selected_league
+        league = normalize_league_name(league)
 
         category_options = FALLBACK_CATEGORY_OPTIONS
         category_warning = ""
@@ -289,7 +355,10 @@ def main() -> None:
             min_value=1.0,
             value=80.0,
             step=1.0,
-            help="Example: if 1 divine = 80 chaos, enter 80.",
+            help=(
+                "Example: if 1 divine = 80 chaos, enter 80. "
+                "Default listing filter uses divine >= 1 and chaos >= this value."
+            ),
         )
 
         min_profit = st.number_input(
@@ -315,6 +384,23 @@ def main() -> None:
             disabled=not bool(st.session_state.query_id),
         )
 
+        telemetry = client.get_telemetry_snapshot()
+        st.divider()
+        st.caption("Request telemetry")
+        st.caption(
+            " | ".join(
+                [
+                    f"req={telemetry['request_count']}",
+                    f"429={telemetry['rate_limit_count']}",
+                    f"retry={telemetry['retry_count']}",
+                    f"cache hit/miss={telemetry['cache_hits']}/{telemetry['cache_misses']}",
+                ]
+            )
+        )
+        st.caption(
+            f"pace={telemetry['min_request_interval']}s, cache_ttl={telemetry['cache_ttl_seconds']}s"
+        )
+
     if start_search:
         if not league:
             st.error("League is required.")
@@ -328,6 +414,7 @@ def main() -> None:
                     rarity_option=selected_rarity,
                     online_only=True,
                 )
+
                 st.session_state.query_id = search.query_id
                 st.session_state.result_ids = search.result_ids
                 st.session_state.active_league = league

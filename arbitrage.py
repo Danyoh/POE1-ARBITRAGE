@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from typing import Any
 
 
@@ -65,8 +66,8 @@ def extract_price(record: dict[str, Any], divine_to_chaos: float) -> dict[str, A
 def _default_group(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "item_name": get_item_name(record),
-        "best_chaos": None,
-        "best_divine": None,
+        "chaos_listings": [],
+        "divine_listings": [],
     }
 
 
@@ -79,13 +80,47 @@ def _update_group_with_record(
 
     listing_id = str(record.get("id", ""))
     if price["currency"] == "chaos":
-        best_chaos = group["best_chaos"]
-        if best_chaos is None or price["amount"] < best_chaos["amount"]:
-            group["best_chaos"] = {**price, "listing_id": listing_id}
+        group["chaos_listings"].append({**price, "listing_id": listing_id})
     elif price["currency"] == "divine":
-        best_divine = group["best_divine"]
-        if best_divine is None or price["chaos_equivalent"] < best_divine["chaos_equivalent"]:
-            group["best_divine"] = {**price, "listing_id": listing_id}
+        # We can only execute this strategy when buy side is >= 1 divine.
+        if price["amount"] >= 1.0:
+            group["divine_listings"].append({**price, "listing_id": listing_id})
+
+
+def _best_threshold_match(
+    chaos_listings: list[dict[str, Any]],
+    divine_listings: list[dict[str, Any]],
+    min_profit_chaos: float,
+) -> dict[str, Any] | None:
+    if not chaos_listings or not divine_listings:
+        return None
+
+    # Sort chaos asks ascending so we can quickly find the first listing
+    # at/above each divine+profit threshold.
+    sorted_chaos = sorted(chaos_listings, key=lambda x: x["amount"])
+    chaos_amounts = [row["amount"] for row in sorted_chaos]
+
+    best_match: dict[str, Any] | None = None
+    for divine in divine_listings:
+        required_chaos = divine["chaos_equivalent"] + min_profit_chaos
+        idx = bisect_left(chaos_amounts, required_chaos)
+        if idx >= len(sorted_chaos):
+            continue
+
+        matched_chaos = sorted_chaos[idx]
+        profit = matched_chaos["amount"] - divine["chaos_equivalent"]
+        candidate = {
+            "profit_chaos": round(profit, 2),
+            "buy_divine_amount": divine["amount"],
+            "buy_chaos_equivalent": round(divine["chaos_equivalent"], 2),
+            "sell_chaos_amount": matched_chaos["amount"],
+            "divine_listing_id": divine["listing_id"],
+            "chaos_listing_id": matched_chaos["listing_id"],
+        }
+        if best_match is None or candidate["profit_chaos"] > best_match["profit_chaos"]:
+            best_match = candidate
+
+    return best_match
 
 
 def analyze_arbitrage(
@@ -105,24 +140,20 @@ def analyze_arbitrage(
 
     opportunities: list[dict[str, Any]] = []
     for group in grouped.values():
-        best_chaos = group["best_chaos"]
-        best_divine = group["best_divine"]
-        if not best_chaos or not best_divine:
+        match = _best_threshold_match(
+            group["chaos_listings"],
+            group["divine_listings"],
+            min_profit_chaos,
+        )
+        if not match:
             continue
 
-        profit = best_chaos["amount"] - best_divine["chaos_equivalent"]
-        if profit >= min_profit_chaos:
-            opportunities.append(
-                {
-                    "item": group["item_name"],
-                    "profit_chaos": round(profit, 2),
-                    "buy_divine_amount": best_divine["amount"],
-                    "buy_chaos_equivalent": round(best_divine["chaos_equivalent"], 2),
-                    "sell_chaos_amount": best_chaos["amount"],
-                    "divine_listing_id": best_divine["listing_id"],
-                    "chaos_listing_id": best_chaos["listing_id"],
-                }
-            )
+        opportunities.append(
+            {
+                "item": group["item_name"],
+                **match,
+            }
+        )
 
     opportunities.sort(key=lambda x: x["profit_chaos"], reverse=True)
     return opportunities
